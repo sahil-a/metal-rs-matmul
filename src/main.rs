@@ -349,7 +349,7 @@ fn main() {
 
     // 2) Configure some matrix sizes that you want to test
     let row_len = 1024;
-    let inner_len = 511;
+    let inner_len = 1024;
     let col_len = 1024;
     let tile_size = 32;
 

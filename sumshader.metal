@@ -141,9 +141,9 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
                             uint2 tid [[ threadgroup_position_in_grid ]],
                             uint2 lid [[ thread_position_in_threadgroup ]],
                             uint2 threads_per_threadgroup [[ threads_per_threadgroup ]],
-                            // the below needs to be set to (tile_size*inner_len) length in rs
+                            // the below needs to be set to (tile_size**2) length in rs
                             threadgroup half *shared_mem_a [[ threadgroup(0) ]],
-                            // the below needs to be set to (tile_size*inner_len) length in rs
+                            // the below needs to be set to (tile_size**2) length in rs
                             threadgroup half *shared_mem_b [[ threadgroup(1) ]],
                             // the below needs to be set to threads length in rs
                             threadgroup half *shared_products [[ threadgroup(2) ]])
