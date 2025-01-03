@@ -90,9 +90,9 @@ kernel void dot_product(device half *a [[ buffer(0) ]],
 }
 
 
-// todo: tiling
-// todo: vectorization
-// todo: inner len limitation - 1024 threads per group
+// this naive implementation has the following limitations:
+// 1. inner len limitation - 1024 threads per group
+// 2. no tiling
 kernel void matrix_multiply(device half *a [[ buffer(0) ]], 
                             device half *b [[ buffer(1) ]],
                             device half *output [[ buffer(2) ]],
@@ -127,5 +127,85 @@ kernel void matrix_multiply(device half *a [[ buffer(0) ]],
     // write the final result to the output at (tid.x, tid.y)
     if (lid.x == 0) {
         output[tid.x * *col_len + tid.y] = shared_mem[0];
+    }
+}
+
+// todo: vectorization
+kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]], 
+                            device half *b [[ buffer(1) ]],
+                            device half *output [[ buffer(2) ]],
+                            device uint *row_len [[ buffer(3) ]],
+                            device uint *inner_len [[ buffer(4) ]],
+                            device uint *col_len [[ buffer(5) ]],
+                            device uint *tile_size [[ buffer(6) ]],
+                            uint2 tid [[ threadgroup_position_in_grid ]],
+                            uint2 lid [[ thread_position_in_threadgroup ]],
+                            uint2 threads_per_threadgroup [[ threads_per_threadgroup ]],
+                            // the below needs to be set to (tile_size*inner_len) length in rs
+                            threadgroup half *shared_mem_a [[ threadgroup(0) ]],
+                            // the below needs to be set to (tile_size*inner_len) length in rs
+                            threadgroup half *shared_mem_b [[ threadgroup(1) ]],
+                            // the below needs to be set to inner_len length in rs
+                            threadgroup half *shared_products [[ threadgroup(2) ]])
+{
+
+    uint items_per_thread = (*inner_len + threads_per_threadgroup.x - 1) / threads_per_threadgroup.x;
+
+    // 1. Load all rows of A and cols of B for this tile
+    // within shared memory, rows of A are first, then columns of B
+    for (uint tile = 0; tile < *tile_size; tile++) {
+        uint x = tid.x * *tile_size + tile;
+        uint y = tid.y * *tile_size + tile;
+
+        if (x < *row_len) { // load row x
+            for (uint i = 0; i < items_per_thread; i++) {
+                uint idx = items_per_thread * tid.x + i;
+                if (idx < *inner_len) {
+                    // load element of row x of A into shared mem
+                    shared_mem_a[*inner_len * tile + idx] = a[x * *inner_len + idx];
+                }
+            }
+        }
+        if (y < *col_len) { // load col y
+            for (uint i = 0; i < items_per_thread; i++) {
+                uint idx = items_per_thread * tid.x + i;
+                if (idx < *inner_len) {
+                    // load element of col y of B into shared mem
+                    shared_mem_b[*inner_len * tile + idx] = b[idx * *col_len + y];
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+
+    // 2. Compute output for each tile serially
+    for (uint tile_x = 0; tile_x < *tile_size; tile_x++) {
+        for (uint tile_y = 0; tile_y < *tile_size; tile_y++) {
+            uint x = tid.x * *tile_size + tile_x;
+            uint y = tid.y * *tile_size + tile_y;
+
+            if (x < *row_len && y < *col_len) {
+                // store products in shared products
+                for (uint i = 0; i < items_per_thread; i++) {
+                    uint idx = items_per_thread * tid.x + i;
+                    shared_products[idx] = shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // parallel reduction within the thread group to shared_products[0]
+                for (uint stride = 2; stride/2 < threads_per_threadgroup.x; stride <<= 1) {
+                    if (lid.x % stride == 0 && (lid.x + stride/2 < threads_per_threadgroup.x)) {
+                        shared_products[lid.x] += shared_products[lid.x + stride/2];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                // write the final result to the output
+                if (lid.x == 0) {
+                    output[x * *col_len + y] = shared_products[0];
+                }
+            }
+        }
     }
 }
