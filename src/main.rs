@@ -205,51 +205,92 @@ fn create_buffer<T: Copy>(device: &Device, data: &[T]) -> Buffer {
     device.new_buffer_with_data(raw_ptr, size, MTLResourceOptions::CPUCacheModeDefaultCache)
 }
 
+/// CPU implementation of matrix multiplication for comparison.
+fn cpu_matrix_multiply(
+    a: &[f16],
+    b: &[f16],
+    row_len: u32,
+    inner_len: u32,
+    col_len: u32,
+) -> Vec<f16> {
+    let mut result = vec![f16::from_f32(0.0); (row_len * col_len) as usize];
+
+    for i in 0..row_len {
+        for j in 0..col_len {
+            let mut sum = f16::from_f32(0.0);
+            for k in 0..inner_len {
+                let a_idx = (i * inner_len + k) as usize;
+                let b_idx = (k * col_len + j) as usize;
+                sum = sum + a[a_idx] * b[b_idx];
+            }
+            result[(i * col_len + j) as usize] = sum;
+        }
+    }
+
+    result
+}
+
 fn main() {
-    // Create the shared Metal context
+    // 1) Create the shared Metal context
     let context = MetalContext::new("sumshader.metallib");
 
-    // Configure some matrix sizes that you want to test
+    // 2) Configure some matrix sizes that you want to test
     let row_len = 512;
     let inner_len = 512;
     let col_len = 512;
 
-    // Create some test data
+    // 3) Create some test data
     let mat_a = vec![f16::from_f32(2.0); (row_len * inner_len) as usize];
     let mat_b = vec![f16::from_f32(4.0); (inner_len * col_len) as usize];
 
-    // Number of times to repeat for the benchmark
-    let iterations = 10;
+    // For the GFLOPS calculation, each output element requires `inner_len` multiply-add pairs
+    // => 2 * inner_len ops per output element.
+    let total_ops = 2.0 * row_len as f64 * col_len as f64 * inner_len as f64;
+
+    // 4) GPU Benchmark
 
     // Optional warmup to ensure GPU is “warmed up”
     for _ in 0..2 {
         let _ = context.matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
     }
 
-    // Now perform the actual benchmark
-    let start = Instant::now();
+    let iterations = 10;
+    let gpu_start = Instant::now();
     for _ in 0..iterations {
         let _ = context.matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
     }
-    let total_time = start.elapsed();
-    let avg_time = total_time / iterations;
-
-    // Compute a rough FLOP count.
-    // Each output element requires `inner_len` multiply-add pairs => 2 * inner_len ops per output element.
-    // For a row_len x col_len result, total_ops = 2 * row_len * col_len * inner_len.
-    let total_ops = 2.0 * row_len as f64 * col_len as f64 * inner_len as f64;
-
-    // Convert average time to seconds
-    let avg_time_s = avg_time.as_secs_f64();
-
-    // GFLOPS = (total_ops / time_in_seconds) / 1e9
-    // but note that we do this on a "per dispatch" basis using avg_time,
-    // so it's for a single multiplication's worth of ops.
-    let gflops = (total_ops / avg_time_s) / 1e9;
+    let gpu_total_time = gpu_start.elapsed();
+    let gpu_avg_time = gpu_total_time / iterations;
+    let gpu_avg_time_s = gpu_avg_time.as_secs_f64();
+    let gpu_gflops = (total_ops / gpu_avg_time_s) / 1e9;
 
     println!(
-        "Ran {iterations} matrix multiplies of size {row_len}x{inner_len} * {inner_len}x{col_len} \
+        "GPU: ran {iterations} multiplies of size {row_len}x{inner_len} * {inner_len}x{col_len} \
          in {:#?} total; ~{:#?} each => approx. {:.2} GFLOPS",
-        total_time, avg_time, gflops
+        gpu_total_time, gpu_avg_time, gpu_gflops
+    );
+
+    // 5) CPU Benchmark
+    // We do the same number of iterations so the time is comparable.
+    let cpu_start = Instant::now();
+    for _ in 0..iterations {
+        let _ = cpu_matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
+    }
+    let cpu_total_time = cpu_start.elapsed();
+    let cpu_avg_time = cpu_total_time / iterations;
+    let cpu_avg_time_s = cpu_avg_time.as_secs_f64();
+    let cpu_gflops = (total_ops / cpu_avg_time_s) / 1e9;
+
+    println!(
+        "CPU: ran {iterations} multiplies of size {row_len}x{inner_len} * {inner_len}x{col_len} \
+         in {:#?} total; ~{:#?} each => approx. {:.2} GFLOPS",
+        cpu_total_time, cpu_avg_time, cpu_gflops
+    );
+
+    // 6) Print speedup (how many times faster GPU is than CPU)
+    let speedup = cpu_avg_time_s / gpu_avg_time_s;
+    println!(
+        "GPU is about {:.2}x faster than CPU for this problem size.",
+        speedup
     );
 }
