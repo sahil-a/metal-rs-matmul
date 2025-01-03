@@ -131,6 +131,7 @@ kernel void matrix_multiply(device half *a [[ buffer(0) ]],
 }
 
 // todo: vectorization
+// todo: tiling across inner dimension
 kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]], 
                             device half *b [[ buffer(1) ]],
                             device half *output [[ buffer(2) ]],
@@ -185,14 +186,16 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
             uint x = tid.x * *tile_size + tile_x;
             uint y = tid.y * *tile_size + tile_y;
 
+            shared_products[lid.x] = half(0.0); // zero out previous results
             if (x < *row_len && y < *col_len) {
-                shared_products[lid.x] = half(0.0);
                 // store products in shared products
                 for (uint i = 0; i < items_per_thread; i++) {
                     uint idx = items_per_thread * lid.x + i;
-                    shared_products[lid.x] += shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
+                    if (idx < *inner_len) {
+                        shared_products[lid.x] += shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
+                    }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup); // this is within a uniform condition
 
                 // parallel reduction within the thread group to shared_products[0]
                 for (uint stride = 2; stride/2 < threads_per_threadgroup.x; stride <<= 1) {

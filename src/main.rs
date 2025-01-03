@@ -348,9 +348,10 @@ fn main() {
     let context = MetalContext::new("sumshader.metallib");
 
     // 2) Configure some matrix sizes that you want to test
-    let row_len = 512;
-    let inner_len = 512;
-    let col_len = 512;
+    let row_len = 1024;
+    let inner_len = 511;
+    let col_len = 1024;
+    let tile_size = 16;
 
     // 3) Create some test data
     let mat_a = vec![f16::from_f32(2.0); (row_len * inner_len) as usize];
@@ -367,7 +368,7 @@ fn main() {
         row_len,
         inner_len,
         col_len,
-        16,
+        tile_size, // beyond this, we run out of kernel memory
         context
             .matrix_multiply_tiled_pipeline
             .thread_execution_width() as u32,
@@ -391,6 +392,7 @@ fn main() {
 
     if has_error {
         println!("GPU result (incorrect): {:?}", gpu_result);
+        println!("CPU result (correct): {:?}", cpu_result);
         panic!("GPU and CPU results differ significantly");
     }
 
@@ -412,7 +414,7 @@ fn main() {
             row_len,
             inner_len,
             col_len,
-            32,
+            tile_size,
             context
                 .matrix_multiply_tiled_pipeline
                 .thread_execution_width() as u32,
