@@ -281,12 +281,12 @@ impl MetalContext {
             //    First buffer: Tile of matrix A (tile_size rows x inner_len columns)
             encoder.set_threadgroup_memory_length(
                 0,
-                (tile_size * inner_len) as u64 * (mem::size_of::<f16>() as u64),
+                (tile_size * tile_size) as u64 * (mem::size_of::<f16>() as u64),
             );
             //    Second buffer: Tile of matrix B (inner_len rows x tile_size columns)
             encoder.set_threadgroup_memory_length(
                 1,
-                (tile_size * inner_len) as u64 * (mem::size_of::<f16>() as u64),
+                (tile_size * tile_size) as u64 * (mem::size_of::<f16>() as u64),
             );
             //    Third buffer: Temporary storage for partial products per thread
             encoder.set_threadgroup_memory_length(
@@ -351,7 +351,7 @@ fn main() {
     let row_len = 1024;
     let inner_len = 511;
     let col_len = 1024;
-    let tile_size = 16;
+    let tile_size = 32;
 
     // 3) Create some test data
     let mat_a = vec![f16::from_f32(2.0); (row_len * inner_len) as usize];
@@ -392,7 +392,7 @@ fn main() {
 
     if has_error {
         println!("GPU result (incorrect): {:?}", gpu_result);
-        println!("CPU result (correct): {:?}", cpu_result);
+        //println!("CPU result (correct): {:?}", cpu_result);
         panic!("GPU and CPU results differ significantly");
     }
 

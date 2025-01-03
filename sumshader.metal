@@ -131,7 +131,6 @@ kernel void matrix_multiply(device half *a [[ buffer(0) ]],
 }
 
 // todo: vectorization
-// todo: tiling across inner dimension
 kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]], 
                             device half *b [[ buffer(1) ]],
                             device half *output [[ buffer(2) ]],
@@ -150,64 +149,65 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
                             threadgroup half *shared_products [[ threadgroup(2) ]])
 {
 
-    uint items_per_thread = (*inner_len + threads_per_threadgroup.x - 1) / threads_per_threadgroup.x;
+    uint items_per_thread = (*tile_size + threads_per_threadgroup.x - 1) / threads_per_threadgroup.x;
+    for (uint inner_start = 0; inner_start < *inner_len; inner_start += *tile_size) {
+        // 1. Load all rows of A and cols of B for this tile
+        // within shared memory, rows of A are first, then columns of B
+        for (uint tile = 0; tile < *tile_size; tile++) {
+            uint x = tid.x * *tile_size + tile;
+            uint y = tid.y * *tile_size + tile;
 
-    // 1. Load all rows of A and cols of B for this tile
-    // within shared memory, rows of A are first, then columns of B
-    for (uint tile = 0; tile < *tile_size; tile++) {
-        uint x = tid.x * *tile_size + tile;
-        uint y = tid.y * *tile_size + tile;
-
-        if (x < *row_len) { // load row x
-            for (uint i = 0; i < items_per_thread; i++) {
-                uint idx = items_per_thread * lid.x + i;
-                if (idx < *inner_len) {
-                    // load element of row x of A into shared mem
-                    shared_mem_a[*inner_len * tile + idx] = a[x * *inner_len + idx];
-                }
-            }
-        }
-        if (y < *col_len) { // load col y
-            for (uint i = 0; i < items_per_thread; i++) {
-                uint idx = items_per_thread * lid.x + i;
-                if (idx < *inner_len) {
-                    // load element of col y of B into shared mem
-                    shared_mem_b[*inner_len * tile + idx] = b[idx * *col_len + y];
-                }
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-
-    // 2. Compute output for each tile serially
-    for (uint tile_x = 0; tile_x < *tile_size; tile_x++) {
-        for (uint tile_y = 0; tile_y < *tile_size; tile_y++) {
-            uint x = tid.x * *tile_size + tile_x;
-            uint y = tid.y * *tile_size + tile_y;
-
-            shared_products[lid.x] = half(0.0); // zero out previous results
-            if (x < *row_len && y < *col_len) {
-                // store products in shared products
+            if (x < *row_len) { // load row x
                 for (uint i = 0; i < items_per_thread; i++) {
                     uint idx = items_per_thread * lid.x + i;
-                    if (idx < *inner_len) {
-                        shared_products[lid.x] += shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
+                    if (idx+inner_start < *inner_len) {
+                        // load element of row x of A into shared mem
+                        shared_mem_a[*tile_size * tile + idx] = a[x * *inner_len + idx + inner_start];
                     }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup); // this is within a uniform condition
-
-                // parallel reduction within the thread group to shared_products[0]
-                for (uint stride = 2; stride/2 < threads_per_threadgroup.x; stride <<= 1) {
-                    if (lid.x % stride == 0 && (lid.x + stride/2 < threads_per_threadgroup.x)) {
-                        shared_products[lid.x] += shared_products[lid.x + stride/2];
+            }
+            if (y < *col_len) { // load col y
+                for (uint i = 0; i < items_per_thread; i++) {
+                    uint idx = items_per_thread * lid.x + i;
+                    if (idx+inner_start < *inner_len) {
+                        // load element of col y of B into shared mem
+                        shared_mem_b[*tile_size * tile + idx] = b[(idx+inner_start) * *col_len + y];
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                // write the final result to the output
-                if (lid.x == 0) {
-                    output[x * *col_len + y] = shared_products[0];
+
+        // 2. Compute output for each tile serially
+        for (uint tile_x = 0; tile_x < *tile_size; tile_x++) {
+            for (uint tile_y = 0; tile_y < *tile_size; tile_y++) {
+                uint x = tid.x * *tile_size + tile_x;
+                uint y = tid.y * *tile_size + tile_y;
+
+                shared_products[lid.x] = half(0.0); // zero out previous results
+                if (x < *row_len && y < *col_len) {
+                    // store products in shared products
+                    for (uint i = 0; i < items_per_thread; i++) {
+                        uint idx = items_per_thread * lid.x + i;
+                        if (idx+inner_start < *inner_len) {
+                            shared_products[lid.x] += shared_mem_a[*tile_size * tile_x + idx] * shared_mem_b[*tile_size * tile_y + idx];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup); // this is within a uniform condition
+
+                    // parallel reduction within the thread group to shared_products[0]
+                    for (uint stride = 2; stride/2 < threads_per_threadgroup.x; stride <<= 1) {
+                        if (lid.x % stride == 0 && (lid.x + stride/2 < threads_per_threadgroup.x)) {
+                            shared_products[lid.x] += shared_products[lid.x + stride/2];
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+
+                    // write the final result to the output
+                    if (lid.x == 0) {
+                        output[x * *col_len + y] += shared_products[0];
+                    }
                 }
             }
         }
