@@ -12,6 +12,7 @@ pub struct MetalContext {
     command_queue: CommandQueue,
     dot_product_pipeline: ComputePipelineState,
     matrix_multiply_pipeline: ComputePipelineState,
+    matrix_multiply_tiled_pipeline: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -42,11 +43,18 @@ impl MetalContext {
                 .new_compute_pipeline_state_with_function(&mat_kernel)
                 .unwrap();
 
+            // 6. Create pipeline for matrix_multiply_tiled kernel
+            let mat_tiled_kernel = library.get_function("matrix_multiply_tiled", None).unwrap();
+            let matrix_multiply_tiled_pipeline = device
+                .new_compute_pipeline_state_with_function(&mat_tiled_kernel)
+                .unwrap();
+
             Self {
                 device,
                 command_queue,
                 dot_product_pipeline,
                 matrix_multiply_pipeline,
+                matrix_multiply_tiled_pipeline,
             }
         })
     }
@@ -113,7 +121,7 @@ impl MetalContext {
     /// Multiply two matrices (A of size row_len x inner_len, and B of size inner_len x col_len)
     /// stored in row-major order. Both inputs are `Vec<f16>`; output is `Vec<u32>` (the sum can fit in 32 bits).
     ///
-    /// Returns a `row_len * col_len` vector of `u32`.
+    /// Returns a `row_len * col_len` vector of `f16`.
     pub fn matrix_multiply(
         &self,
         a: &[f16],
@@ -195,6 +203,111 @@ impl MetalContext {
             output_slice.to_vec()
         })
     }
+
+    // Note - thread group memory (32KB) is exhausted beyond square matrices of size 1024
+    //
+    /// Multiply two matrices (A of size row_len x inner_len, and B of size inner_len x col_len)
+    /// stored in row-major order. Both inputs are `Vec<f16>`; output is `Vec<f16>`
+    ///
+    /// Returns a `row_len * col_len` vector of `f16`.
+    pub fn matrix_multiply_tiled(
+        &self,
+        a: &[f16],
+        b: &[f16],
+        row_len: u32,
+        inner_len: u32,
+        col_len: u32,
+        tile_size: u32,
+        thread_count: u32,
+    ) -> Vec<f16> {
+        // Sanity checks
+        assert_eq!(
+            a.len() as u32,
+            row_len * inner_len,
+            "Dimensions of A are incorrect."
+        );
+        assert_eq!(
+            b.len() as u32,
+            inner_len * col_len,
+            "Dimensions of B are incorrect."
+        );
+        assert!(
+            thread_count <= inner_len,
+            "Thread count must be less than or equal to inner length"
+        );
+
+        let out_len = row_len * col_len;
+
+        autoreleasepool(|| {
+            // 1. Create buffers
+            let input_buffer_a = create_buffer(&self.device, a);
+            let input_buffer_b = create_buffer(&self.device, b);
+            let output_buffer = create_buffer(
+                &self.device,
+                vec![f16::from_f32(0.0); out_len as usize].as_slice(),
+            );
+            let row_len_buffer = create_buffer(&self.device, &[row_len]);
+            let inner_len_buffer = create_buffer(&self.device, &[inner_len]);
+            let col_len_buffer = create_buffer(&self.device, &[col_len]);
+            let tile_size_buffer = create_buffer(&self.device, &[tile_size]);
+
+            // 2. Create command buffer & encoder
+            let command_buffer = self.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+
+            // 3. Set pipeline & buffers
+            encoder.set_compute_pipeline_state(&self.matrix_multiply_tiled_pipeline);
+            encoder.set_buffer(0, Some(&input_buffer_a), 0);
+            encoder.set_buffer(1, Some(&input_buffer_b), 0);
+            encoder.set_buffer(2, Some(&output_buffer), 0);
+            encoder.set_buffer(3, Some(&row_len_buffer), 0);
+            encoder.set_buffer(4, Some(&inner_len_buffer), 0);
+            encoder.set_buffer(5, Some(&col_len_buffer), 0);
+            encoder.set_buffer(6, Some(&tile_size_buffer), 0);
+
+            // 4. Determine thread layout
+            //    We'll dispatch (row_len x col_len) threadgroups, each having 'inner_len' threads.
+            let threadgroup_count = MTLSize {
+                width: ((row_len + tile_size - 1) / tile_size) as u64,
+                height: ((col_len + tile_size - 1) / tile_size) as u64,
+                depth: 1,
+            };
+            let threadgroup_size = MTLSize {
+                width: thread_count as u64,
+                height: 1,
+                depth: 1,
+            };
+            // 5. Allocate threadgroup memory
+            //    First buffer: Tile of matrix A (tile_size rows x inner_len columns)
+            encoder.set_threadgroup_memory_length(
+                0,
+                (tile_size * inner_len) as u64 * (mem::size_of::<f16>() as u64),
+            );
+            //    Second buffer: Tile of matrix B (inner_len rows x tile_size columns)
+            encoder.set_threadgroup_memory_length(
+                1,
+                (tile_size * inner_len) as u64 * (mem::size_of::<f16>() as u64),
+            );
+            //    Third buffer: Temporary storage for partial products per thread
+            encoder.set_threadgroup_memory_length(
+                2,
+                (thread_count as usize * mem::size_of::<f16>()) as u64,
+            );
+
+            // 6. Encode & dispatch
+            encoder.dispatch_thread_groups(threadgroup_count, threadgroup_size);
+            encoder.end_encoding();
+
+            // 7. Commit & wait
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            // 8. Read results
+            let ptr = output_buffer.contents() as *const f16;
+            let output_slice = unsafe { std::slice::from_raw_parts(ptr, out_len as usize) };
+            output_slice.to_vec()
+        })
+    }
 }
 
 /// A helper to create a Metal buffer from a slice of data.
@@ -247,17 +360,63 @@ fn main() {
     // => 2 * inner_len ops per output element.
     let total_ops = 2.0 * row_len as f64 * col_len as f64 * inner_len as f64;
 
-    // 4) GPU Benchmark
+    // 4) Run GPU computation and verify accuracy
+    let gpu_result = context.matrix_multiply_tiled(
+        &mat_a,
+        &mat_b,
+        row_len,
+        inner_len,
+        col_len,
+        16,
+        context
+            .matrix_multiply_tiled_pipeline
+            .thread_execution_width() as u32,
+    );
+    // Verify GPU result against CPU result
+    let cpu_result = cpu_matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
+    assert_eq!(
+        gpu_result.len(),
+        cpu_result.len(),
+        "GPU and CPU results have different lengths"
+    );
 
-    // Optional warmup to ensure GPU is “warmed up”
+    // Allow small floating-point differences due to precision
+    let mut has_error = false;
+    for (gpu_val, cpu_val) in gpu_result.iter().zip(cpu_result.iter()) {
+        if (gpu_val.to_f32() - cpu_val.to_f32()).abs() >= 1e-3 {
+            has_error = true;
+            break;
+        }
+    }
+
+    if has_error {
+        println!("GPU result (incorrect): {:?}", gpu_result);
+        panic!("GPU and CPU results differ significantly");
+    }
+
+    // 5) GPU Benchmark
+
+    // Optional warmup to ensure GPU is "warmed up"
     for _ in 0..2 {
         let _ = context.matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
     }
 
     let iterations = 10;
+
     let gpu_start = Instant::now();
     for _ in 0..iterations {
-        let _ = context.matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
+        //let _ = context.matrix_multiply(&mat_a, &mat_b, row_len, inner_len, col_len);
+        let _ = context.matrix_multiply_tiled(
+            &mat_a,
+            &mat_b,
+            row_len,
+            inner_len,
+            col_len,
+            32,
+            context
+                .matrix_multiply_tiled_pipeline
+                .thread_execution_width() as u32,
+        );
     }
     let gpu_total_time = gpu_start.elapsed();
     let gpu_avg_time = gpu_total_time / iterations;
@@ -270,7 +429,7 @@ fn main() {
         gpu_total_time, gpu_avg_time, gpu_gflops
     );
 
-    // 5) CPU Benchmark
+    // 6) CPU Benchmark
     // We do the same number of iterations so the time is comparable.
     let cpu_start = Instant::now();
     for _ in 0..iterations {
@@ -287,7 +446,7 @@ fn main() {
         cpu_total_time, cpu_avg_time, cpu_gflops
     );
 
-    // 6) Print speedup (how many times faster GPU is than CPU)
+    // 7) Print speedup (how many times faster GPU is than CPU)
     let speedup = cpu_avg_time_s / gpu_avg_time_s;
     println!(
         "GPU is about {:.2}x faster than CPU for this problem size.",

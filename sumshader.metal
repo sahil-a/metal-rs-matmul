@@ -145,7 +145,7 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
                             threadgroup half *shared_mem_a [[ threadgroup(0) ]],
                             // the below needs to be set to (tile_size*inner_len) length in rs
                             threadgroup half *shared_mem_b [[ threadgroup(1) ]],
-                            // the below needs to be set to inner_len length in rs
+                            // the below needs to be set to threads length in rs
                             threadgroup half *shared_products [[ threadgroup(2) ]])
 {
 
@@ -159,7 +159,7 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
 
         if (x < *row_len) { // load row x
             for (uint i = 0; i < items_per_thread; i++) {
-                uint idx = items_per_thread * tid.x + i;
+                uint idx = items_per_thread * lid.x + i;
                 if (idx < *inner_len) {
                     // load element of row x of A into shared mem
                     shared_mem_a[*inner_len * tile + idx] = a[x * *inner_len + idx];
@@ -168,7 +168,7 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
         }
         if (y < *col_len) { // load col y
             for (uint i = 0; i < items_per_thread; i++) {
-                uint idx = items_per_thread * tid.x + i;
+                uint idx = items_per_thread * lid.x + i;
                 if (idx < *inner_len) {
                     // load element of col y of B into shared mem
                     shared_mem_b[*inner_len * tile + idx] = b[idx * *col_len + y];
@@ -186,10 +186,11 @@ kernel void matrix_multiply_tiled(device half *a [[ buffer(0) ]],
             uint y = tid.y * *tile_size + tile_y;
 
             if (x < *row_len && y < *col_len) {
+                shared_products[lid.x] = half(0.0);
                 // store products in shared products
                 for (uint i = 0; i < items_per_thread; i++) {
-                    uint idx = items_per_thread * tid.x + i;
-                    shared_products[idx] = shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
+                    uint idx = items_per_thread * lid.x + i;
+                    shared_products[lid.x] += shared_mem_a[*inner_len * tile_x + idx] * shared_mem_b[*inner_len * tile_y + idx];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
